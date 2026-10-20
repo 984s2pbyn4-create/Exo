@@ -23,7 +23,7 @@ canvas{width:100%;height:90px;display:block;border-radius:10px;background:#000;m
 .msg .meta{display:flex;justify-content:space-between;color:var(--mut);font-size:12px;margin-top:6px}.msg button{border:0;background:var(--line);color:var(--tx);border-radius:6px;padding:3px 8px;font-size:12px}
 .fail{border-color:var(--warn)}#status{font-weight:600;margin-top:10px}
 </style></head><body>
-<h1>ЭХО <small>текст звуком · v1.0</small></h1>
+<h1>ЭХО <small>текст звуком · v1.1</small></h1>
 <div class="tabs"><button id="tS" class="on">Передать</button><button id="tR">Принять</button></div>
 <div id="pS">
  <div class="card">
@@ -41,6 +41,8 @@ canvas{width:100%;height:90px;display:block;border-radius:10px;background:#000;m
   <canvas id="wf" width="600" height="180"></canvas>
   <div id="status" class="mut">Остановлено</div>
   <div class="bar"><i id="rp"></i></div>
+  <div id="dbg" class="mut" style="margin-top:6px">—</div>
+  <div class="row"><button class="big ghost" id="rec">Сохранить запись (20 с)</button></div>
  </div>
  <div id="log"></div>
 </div>
@@ -156,25 +158,31 @@ class Receiver{
   const nc=j=>re[j+L-1]/(this.tn*Math.sqrt(E[j+L]-E[j])+1e-9);
   for(let j=0;j<=N-2*L;j++){if(nc(j)>this.TH){let bj=j,bv=nc(j);for(let k=j+1;k<j+L;k++){const v=nc(k);if(v>bv){bv=v;bj=k;}}return{p:s+bj,q:bv};}}
   return null;}
- demod(abs,m,par){const s=abs-this.base+Math.round(m.off*this.sr),n=Math.round(m.W*this.sr),v=[];
-  for(let g=0;g<m.G;g++){let bt=0,bp=-1;for(let t=0;t<4;t++){const p=goertzel(this.buf,s,n,toneFreq(m,g,par,t),this.sr);if(p>bp){bp=p;bt=t;}}v.push(bt);}return v;}
+ demod(abs,m,par){const s=abs-this.base+Math.round(m.off*this.sr),n=Math.round(m.W*this.sr),v=[];let cs=0;
+  for(let g=0;g<m.G;g++){let bt=0,bp=-1,sm=0;for(let t=0;t<4;t++){const p=goertzel(this.buf,s,n,toneFreq(m,g,par,t),this.sr);sm+=p;if(p>bp){bp=p;bt=t;}}v.push(bt);cs+=bp/(sm+1e-12);}
+  return{v,c:cs/m.G};}
  symStart(i,m,t0){return t0+Math.round(i*m.Ts*this.sr);}
  process(){const sr=this.sr;
   for(;;){
    if(this.state==='search'){if(this.end-this.sp<this.N)return;const r=this.corr(this.sp);
     if(!r){this.sp+=this.N-2*this.L;continue;}
     this.p=r.p;this.q=r.q;this.h0=r.p+Math.round((CH_LEN+GAP)*sr);this.state='hdr';this.cb({type:'sync',q:r.q});}
-   if(this.state==='hdr'){const m=MODES[0],need=this.symStart(HDR_SYMS,m,this.h0)+Math.round(0.002*sr);if(this.end<need)return;
-    const sy=[];for(let i=0;i<HDR_SYMS;i++)sy.push(this.demod(this.symStart(i,m,this.h0),m,i&1));
-    const h=parseHeader(symsToBytes(sy,m,8));if(!h){this.cb({type:'hdrfail'});this.state='search';this.sp=this.p+this.L;continue;}
-    this.h=h;this.pm=MODES[h.mode];this.cl=codedLen(h.len);this.ns=Math.ceil(this.cl*8/(2*this.pm.G));this.p0=this.symStart(HDR_SYMS,m,this.h0);
-    this.syms=[];this.state='pay';this.cb({type:'hdr',h,ns:this.ns});}
+   if(this.state==='hdr'){const m=MODES[0],need=this.symStart(HDR_SYMS,m,this.h0)+Math.round(0.015*sr);if(this.end<need)return;
+    let best=null;for(let d=-12;d<=12;d++){const sh=Math.round(d*0.001*sr),sy=[];let cc=0;
+     for(let i=0;i<HDR_SYMS;i++){const r=this.demod(this.symStart(i,m,this.h0)+sh,m,i&1);sy.push(r.v);cc+=r.c;}
+     const h=parseHeader(symsToBytes(sy,m,8));if(h){const sc=h.errs-cc;if(!best||sc<best.sc)best={h,sh,sc};}}
+    if(!best){this.cb({type:'hdrfail',q:this.q});this.state='search';this.sp=this.p+Math.round(0.02*sr);continue;}
+    const h=best.h;this.h=h;this.sh0=this.sh=best.sh;this.pm=MODES[h.mode];this.cl=codedLen(h.len);this.ns=Math.ceil(this.cl*8/(2*this.pm.G));this.p0=this.symStart(HDR_SYMS,m,this.h0);
+    this.syms=[];this.state='pay';this.cb({type:'hdr',h,ns:this.ns,q:this.q,off:best.sh/sr*1000});}
    if(this.state==='pay'){const m=this.pm;
-    while(this.syms.length<this.ns){const i=this.syms.length,st=this.symStart(i,m,this.p0);if(st+Math.round(m.Ts*sr)>this.end)break;this.syms.push(this.demod(st,m,i&1));}
+    const dl=Math.max(1,Math.round(0.0005*sr)),lim=Math.round(0.004*sr);
+    while(this.syms.length<this.ns){const i=this.syms.length,st=this.symStart(i,m,this.p0);if(st+this.sh+lim+Math.round(m.Ts*sr)>this.end)break;
+     let b=null;for(const d of[-dl,0,dl]){const o=this.sh+d;if(Math.abs(o-this.sh0)>lim)continue;const r=this.demod(st+o,m,i&1);if(!b||r.c>b.c+(d?0.04:0))b={...r,o};}
+     this.sh=b.o;this.syms.push(b.v);}
     this.cb({type:'prog',f:this.syms.length/this.ns});if(this.syms.length<this.ns)return;
     const r=decodePayload(symsToBytes(this.syms,m,this.cl),this.h.len);
-    this.cb(r?{type:'msg',bytes:r.bytes,enc:this.h.enc,errs:r.errs+this.h.errs,mode:this.h.mode,q:this.q,len:this.h.len}:{type:'payfail',mode:this.h.mode});
-    this.sp=this.symStart(this.ns,m,this.p0);this.state='search';}
+    this.cb(r?{type:'msg',bytes:r.bytes,enc:this.h.enc,errs:r.errs+this.h.errs,mode:this.h.mode,q:this.q,len:this.h.len}:{type:'payfail',mode:this.h.mode,q:this.q});
+    this.sp=this.symStart(this.ns,m,this.p0)+this.sh;this.state='search';}
   }}
 }
 //module.exports={MODES,makeFrame,buildSignal,Receiver,encodeText,decodeText,rsEncode,rsDecode,frameDuration};
@@ -200,23 +208,30 @@ $('send').onclick=async()=>{if(src){src.stop();return;}const s=$('txt').value;if
  const tick=()=>{$('tp').style.width=Math.min(100,(c.currentTime-t0)/d*100)+'%';raf=requestAnimationFrame(tick);};tick();
  src.onended=()=>{cancelAnimationFrame(raf);src=null;$('send').textContent='Передать';$('send').classList.remove('stop');$('tp').style.width='0';};};
 // ---- receive ----
-let stream=null,proc=null,an=null,R=null,wfRaf=0;
+let stream=null,proc=null,an=null,R=null,wfRaf=0,ring=null,rpos=0,rfull=false;
 const st=(t,c)=>{$('status').textContent=t;$('status').style.color=c||'';};
 async function startListen(){setSess('play-and-record');const c=getCtx();
  try{stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,channelCount:1}});}
  catch(e){st('Нет доступа к микрофону: '+e.message,'var(--warn)');return;}
  const s=c.createMediaStreamSource(stream);proc=c.createScriptProcessor(4096,1,1);an=c.createAnalyser();an.fftSize=2048;an.smoothingTimeConstant=0;
  const z=c.createGain();z.gain.value=0;s.connect(proc);s.connect(an);proc.connect(z);z.connect(c.destination);
- R=new Receiver(c.sampleRate,onEv);proc.onaudioprocess=ev=>{try{R.push(new Float32Array(ev.inputBuffer.getChannelData(0)));}catch(err){st('Ошибка: '+err.message,'var(--warn)');}};
+ R=new Receiver(c.sampleRate,onEv);ring=new Float32Array(c.sampleRate*20);rpos=0;rfull=false;proc.onaudioprocess=ev=>{try{const x=new Float32Array(ev.inputBuffer.getChannelData(0));for(let i=0;i<x.length;i++){ring[rpos++]=x[i];if(rpos>=ring.length){rpos=0;rfull=true;}}R.push(x);}catch(err){st('Ошибка: '+err.message,'var(--warn)');}};
  $('listen').textContent='Стоп';$('listen').classList.add('stop');st('Слушаю эфир…');drawWF();}
 function stopListen(){if(!stream)return;stream.getTracks().forEach(t=>t.stop());proc&&proc.disconnect();stream=null;proc=null;cancelAnimationFrame(wfRaf);
  $('listen').textContent='Слушать';$('listen').classList.remove('stop');st('Остановлено');$('rp').style.width='0';}
+$('rec').onclick=async()=>{if(!ring){alert('Сначала нажмите «Слушать» и проиграйте передачу');return;}
+ const sr=ctx.sampleRate,a=rfull?[...ring.subarray(rpos),...ring.subarray(0,rpos)]:Array.from(ring.subarray(0,rpos)),n=a.length,b=new DataView(new ArrayBuffer(44+n*2));
+ const ws=(o,s)=>{for(let i=0;i<s.length;i++)b.setUint8(o+i,s.charCodeAt(i));};ws(0,'RIFF');b.setUint32(4,36+n*2,true);ws(8,'WAVEfmt ');b.setUint32(16,16,true);b.setUint16(20,1,true);b.setUint16(22,1,true);
+ b.setUint32(24,sr,true);b.setUint32(28,sr*2,true);b.setUint16(32,2,true);b.setUint16(34,16,true);ws(36,'data');b.setUint32(40,n*2,true);
+ for(let i=0;i<n;i++)b.setInt16(44+i*2,Math.max(-1,Math.min(1,a[i]))*32767,true);
+ const f=new File([b.buffer],'exo_'+Date.now()+'.wav',{type:'audio/wav'});
+ if(navigator.canShare&&navigator.canShare({files:[f]})){try{await navigator.share({files:[f]});}catch(e){}}else{const l=document.createElement('a');l.href=URL.createObjectURL(f);l.download=f.name;l.click();}};
 $('listen').onclick=()=>stream?stopListen():startListen();
 function onEv(e){
- if(e.type==='sync')st('Сигнал пойман…','var(--acc)');
- else if(e.type==='hdr'){st(`Приём: ${MODES[e.h.mode].name}, ${e.h.len-2} байт`,'var(--acc)');}
+ if(e.type==='sync'){st('Сигнал пойман…','var(--acc)');$('dbg').textContent=`синхр. q=${e.q.toFixed(2)}`;}
+ else if(e.type==='hdr'){st(`Приём: ${MODES[e.h.mode].name}, ${e.h.len-2} байт`,'var(--acc)');$('dbg').textContent=`синхр. q=${e.q.toFixed(2)} · сдвиг ${e.off.toFixed(0)} мс · ош. заголовка ${e.h.errs}`;}
  else if(e.type==='prog')$('rp').style.width=(e.f*100)+'%';
- else if(e.type==='hdrfail')st('Помеха — заголовок не прочитан','var(--warn)');
+ else if(e.type==='hdrfail'){st('Заголовок не прочитан — ищу дальше…','var(--warn)');$('dbg').textContent=`синхр. q=${e.q.toFixed(2)} · заголовок: ни один сдвиг не подошёл`;}
  else if(e.type==='payfail'){addMsg(null,'Сообщение повреждено — попросите повторить или выберите режим надёжнее',e);st('Слушаю эфир…');$('rp').style.width='0';}
  else if(e.type==='msg'){decodeText(e.bytes,e.enc).then(t=>addMsg(t,null,e)).catch(()=>addMsg(null,'Ошибка распаковки',e));st('Слушаю эфир…');$('rp').style.width='0';if(navigator.vibrate)navigator.vibrate(80);}}
 function addMsg(t,err,e){const d=document.createElement('div');d.className='msg'+(err?' fail':'');d.textContent=t??err;
